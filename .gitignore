@@ -5,6 +5,11 @@ __pycache__/
 /devenv/
 # C extensions
 *.so
+*.jpg
+*.png
+*.jpeg
+*.webp
+*.gif
 
 # Distribution / packaging
 .Python
