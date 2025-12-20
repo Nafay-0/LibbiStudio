@@ -12,6 +12,19 @@ import jwt       # pip install PyJWT   (IMPORTANT: not the "jwt" package)
 
 BASE_URL = "https://api.klingai.com"
 
+# Defaults are intentionally configurable via env vars because Kling’s endpoints/models
+# can vary by account/region and evolve over time. Reference:
+# https://app.klingai.com/global/dev/document-api/apiReference/model/textToVideo
+DEFAULT_T2V_CREATE_PATH = os.environ.get("KLING_T2V_CREATE_PATH", "/v1/videos/text2video").strip() or "/v1/videos/text2video"
+DEFAULT_T2V_STATUS_PATH_TEMPLATE = (
+    os.environ.get("KLING_T2V_STATUS_PATH_TEMPLATE", "/v1/videos/text2video/{task_id}").strip()
+    or "/v1/videos/text2video/{task_id}"
+)
+# Per Kling docs, the newer field name is `model_name` (model remains forward-compatible).
+# Default per docs is "kling-v1".
+DEFAULT_T2V_MODEL_NAME = (os.environ.get("KLING_T2V_MODEL_NAME") or "kling-v1").strip()
+DEFAULT_T2V_MODEL_LEGACY = (os.environ.get("KLING_T2V_MODEL") or "").strip()
+
 
 # -----------------------------
 # JWT snippet (updated for PyJWT)
@@ -135,9 +148,9 @@ def extract_first_url(obj: Any) -> Optional[str]:
     return None
 
 
-def wait_for_task(task_id: str, token: str, timeout_s: int = 900, poll_s: int = 5) -> dict:
+def wait_for_task(task_id: str, token: str, *, status_path_template: str, timeout_s: int = 900, poll_s: int = 5) -> dict:
     start = time.time()
-    status_url = f"{BASE_URL}/v1/images/generations/{task_id}"
+    status_url = f"{BASE_URL}{status_path_template.format(task_id=task_id)}"
 
     while True:
         if time.time() - start > timeout_s:
@@ -166,9 +179,6 @@ def main() -> None:
     ak = os.environ.get("KLING_ACCESS_KEY", "").strip()
     sk = os.environ.get("KLING_SECRET_KEY", "").strip()
 
-    # If you insist on local hardcode, do it ONLY on your machine:
-    # ak = "..."
-    # sk = "..."
 
     if not ak or not sk:
         raise SystemExit(
@@ -181,16 +191,28 @@ def main() -> None:
     authorization = encode_jwt_token(ak, sk)
     print("API_TOKEN:", authorization)
 
-    # --- Create image generation task ---
-    create_url = f"{BASE_URL}/v1/images/generations"
+    # --- Create text-to-video task ---
+    # Endpoint/model reference:
+    # https://app.klingai.com/global/dev/document-api/apiReference/model/textToVideo
+    create_url = f"{BASE_URL}{DEFAULT_T2V_CREATE_PATH}"
 
     payload = {
-        "model": "kling-v2",
-        "prompt": "A cinematic photo of a snowy Helsinki street at night, soft bokeh",
-        "negative_prompt": "blurry, low quality",
-        "n": 1,
-        "aspect_ratio": "1:1",
+        # Per docs, prefer model_name. (model is forward-compatible; leaving it out is OK.)
+        "model_name": DEFAULT_T2V_MODEL_NAME,
+        "prompt": "A cinematic shot of rainy Helsinki street at night, neon reflections, shallow depth of field",
+        "negative_prompt": "blurry, low quality, artifacts",
+        # Per docs:
+        # - aspect_ratio enum: "16:9" | "9:16" | "1:1"
+        # - duration enum: "5" | "10"  (docs list it as string)
+        "aspect_ratio": "16:9",
+        "duration": "5",
+        # Mode: "std" (default) or "pro"
+        "mode": "std",
+        # Sound: "on" | "off" (only supported in v2.6+)
+        "sound": "off",
     }
+    if DEFAULT_T2V_MODEL_LEGACY:
+        payload["model"] = DEFAULT_T2V_MODEL_LEGACY
 
     create_resp = post_with_retries(
         create_url,
@@ -204,7 +226,13 @@ def main() -> None:
         raise RuntimeError(f"Could not find task_id in response:\n{create_resp}")
 
     # --- Poll until done ---
-    done_resp = wait_for_task(task_id, authorization, timeout_s=900, poll_s=5)
+    done_resp = wait_for_task(
+        task_id,
+        authorization,
+        status_path_template=DEFAULT_T2V_STATUS_PATH_TEMPLATE,
+        timeout_s=1800,
+        poll_s=5,
+    )
     print("\nDone response:", done_resp)
 
     # --- Download output ---
@@ -217,7 +245,15 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # Guess extension (optional)
-    ext = ".png" if "image" in out_url.lower() else ".bin"
+    lower = out_url.lower()
+    if ".mp4" in lower:
+        ext = ".mp4"
+    elif ".mov" in lower:
+        ext = ".mov"
+    elif ".webm" in lower:
+        ext = ".webm"
+    else:
+        ext = ".mp4"
     out_path = out_dir / f"{task_id}{ext}"
 
     file_resp = requests.get(out_url, timeout=120)
