@@ -4,26 +4,28 @@ import os
 import time
 import random
 import pathlib
+import base64
 from typing import Any, Optional
 from dotenv import load_dotenv
 
 import requests  # pip install requests
 import jwt       # pip install PyJWT   (IMPORTANT: not the "jwt" package)
 
-BASE_URL = "https://api.klingai.com"
+DEFAULT_BASE_URL = "https://api.klingai.com"
 
 # Defaults are intentionally configurable via env vars because Kling’s endpoints/models
 # can vary by account/region and evolve over time. Reference:
-# https://app.klingai.com/global/dev/document-api/apiReference/model/textToVideo
-DEFAULT_T2V_CREATE_PATH = os.environ.get("KLING_T2V_CREATE_PATH", "/v1/videos/text2video").strip() or "/v1/videos/text2video"
-DEFAULT_T2V_STATUS_PATH_TEMPLATE = (
-    os.environ.get("KLING_T2V_STATUS_PATH_TEMPLATE", "/v1/videos/text2video/{task_id}").strip()
-    or "/v1/videos/text2video/{task_id}"
+# https://app.klingai.com/global/dev/document-api/apiReference/model/imageToVideo
+BASE_URL = (os.environ.get("KLING_API_BASE") or DEFAULT_BASE_URL).strip().rstrip("/")
+
+DEFAULT_I2V_CREATE_PATH = os.environ.get("KLING_I2V_CREATE_PATH", "/v1/videos/image2video").strip() or "/v1/videos/image2video"
+DEFAULT_I2V_STATUS_PATH_TEMPLATE = (
+    os.environ.get("KLING_I2V_STATUS_PATH_TEMPLATE", "/v1/videos/image2video/{task_id}").strip()
+    or "/v1/videos/image2video/{task_id}"
 )
-# Per Kling docs, the newer field name is `model_name` (model remains forward-compatible).
-# Default per docs is "kling-v1".
-DEFAULT_T2V_MODEL_NAME = (os.environ.get("KLING_T2V_MODEL_NAME") or "kling-v1").strip()
-DEFAULT_T2V_MODEL_LEGACY = (os.environ.get("KLING_T2V_MODEL") or "").strip()
+# Per Kling docs, prefer model_name (model remains forward-compatible).
+DEFAULT_I2V_MODEL_NAME = (os.environ.get("KLING_I2V_MODEL_NAME") or "kling-v1").strip()
+DEFAULT_I2V_MODEL_LEGACY = (os.environ.get("KLING_I2V_MODEL") or "").strip()
 
 
 # -----------------------------
@@ -174,6 +176,62 @@ def wait_for_task(task_id: str, token: str, *, status_path_template: str, timeou
         time.sleep(poll_s)
 
 
+def _read_image_as_base64_no_prefix(path: pathlib.Path) -> str:
+    """
+    Kling Image-to-Video supports passing `image` as:
+    - an image URL, OR
+    - raw Base64 string (NO 'data:image/...;base64,' prefix).
+    Docs: https://app.klingai.com/global/dev/document-api/apiReference/model/imageToVideo
+    """
+    data = path.read_bytes()
+    return base64.b64encode(data).decode("utf-8")
+
+
+def resolve_image_param(image: str) -> str:
+    """
+    Accept:
+    - https://... URL (passed through)
+    - local file path (encoded as raw base64, without data: prefix)
+    - raw base64 (best-effort: if it doesn't look like a path or URL)
+    """
+    s = (image or "").strip()
+    if not s:
+        raise ValueError("image is required (URL, local path, or raw base64).")
+
+    if s.startswith("http://") or s.startswith("https://"):
+        return s
+
+    p = pathlib.Path(s)
+    if p.exists() and p.is_file():
+        return _read_image_as_base64_no_prefix(p)
+
+    # Fallback: treat as already-base64
+    return s
+
+
+def find_default_image() -> Optional[str]:
+    """
+    Convenience: try to find a reasonable local PNG/JPG in the repo to use as a default.
+    """
+    # 1) A commonly produced Runway output file in this repo
+    runway_dir = pathlib.Path("runway_outputs")
+    if runway_dir.exists():
+        for ext in ("*.png", "*.jpg", "*.jpeg"):
+            for p in runway_dir.rglob(ext):
+                if p.is_file():
+                    return str(p)
+
+    # 2) Any asset image in assets/
+    assets_dir = pathlib.Path("assets")
+    if assets_dir.exists():
+        for ext in ("*.png", "*.jpg", "*.jpeg"):
+            for p in assets_dir.rglob(ext):
+                if p.is_file():
+                    return str(p)
+
+    return None
+
+
 def main() -> None:
     # Prefer env vars; do NOT paste secrets into chat
     ak = os.environ.get("KLING_ACCESS_KEY", "").strip()
@@ -191,28 +249,47 @@ def main() -> None:
     authorization = encode_jwt_token(ak, sk)
     print("API_TOKEN:", authorization)
 
-    # --- Create text-to-video task ---
+    # --- Create image-to-video task ---
     # Endpoint/model reference:
-    # https://app.klingai.com/global/dev/document-api/apiReference/model/textToVideo
-    create_url = f"{BASE_URL}{DEFAULT_T2V_CREATE_PATH}"
+    # https://app.klingai.com/global/dev/document-api/apiReference/model/imageToVideo
+    create_url = f"{BASE_URL}{DEFAULT_I2V_CREATE_PATH}"
+
+    # Image can be URL or local path (we'll base64-encode local files without prefix).
+    image_in = (os.environ.get("KLING_I2V_IMAGE") or "").strip()
+    if not image_in:
+        found = find_default_image()
+        if found:
+            image_in = found
+            print(f"Using default image: {image_in}")
+        else:
+            raise SystemExit(
+                "Set KLING_I2V_IMAGE to an https URL or local image path (.png/.jpg/.jpeg).\n"
+                "Example:\n"
+                '  export KLING_I2V_IMAGE="runway_outputs/.../output_1.png"\n'
+            )
+    image_param = resolve_image_param(image_in)
 
     payload = {
-        # Per docs, prefer model_name. (model is forward-compatible; leaving it out is OK.)
-        "model_name": DEFAULT_T2V_MODEL_NAME,
-        "prompt": "A cinematic shot of rainy Helsinki street at night, neon reflections, shallow depth of field",
-        "negative_prompt": "blurry, low quality, artifacts",
-        # Per docs:
-        # - aspect_ratio enum: "16:9" | "9:16" | "1:1"
-        # - duration enum: "5" | "10"  (docs list it as string)
-        "aspect_ratio": "16:9",
-        "duration": "5",
-        # Mode: "std" (default) or "pro"
-        "mode": "std",
-        # Sound: "on" | "off" (only supported in v2.6+)
-        "sound": "off",
+        "model_name": DEFAULT_I2V_MODEL_NAME,
+        "image": image_param,
+        # prompt is optional per docs; but usually gives better results
+        "prompt": (os.environ.get("KLING_I2V_PROMPT") or "The camera slowly pushes in; subtle motion; cinematic").strip(),
+        "negative_prompt": (os.environ.get("KLING_I2V_NEGATIVE_PROMPT") or "blurry, low quality, artifacts").strip(),
+        # duration enum values: "5", "10" (docs list string)
+        "duration": (os.environ.get("KLING_I2V_DURATION") or "5").strip(),
+        # mode: std (default) or pro
+        "mode": (os.environ.get("KLING_I2V_MODE") or "std").strip(),
+        # cfg_scale: float in [0,1] (not supported by kling-v2.x per docs)
+        "cfg_scale": float(os.environ.get("KLING_I2V_CFG_SCALE") or "0.5"),
     }
-    if DEFAULT_T2V_MODEL_LEGACY:
-        payload["model"] = DEFAULT_T2V_MODEL_LEGACY
+
+    # Optional: end-frame control (image_tail)
+    image_tail_in = (os.environ.get("KLING_I2V_IMAGE_TAIL") or "").strip()
+    if image_tail_in:
+        payload["image_tail"] = resolve_image_param(image_tail_in)
+
+    if DEFAULT_I2V_MODEL_LEGACY:
+        payload["model"] = DEFAULT_I2V_MODEL_LEGACY
 
     create_resp = post_with_retries(
         create_url,
@@ -229,7 +306,7 @@ def main() -> None:
     done_resp = wait_for_task(
         task_id,
         authorization,
-        status_path_template=DEFAULT_T2V_STATUS_PATH_TEMPLATE,
+        status_path_template=DEFAULT_I2V_STATUS_PATH_TEMPLATE,
         timeout_s=1800,
         poll_s=5,
     )
