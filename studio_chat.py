@@ -11,6 +11,10 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
+try:
+    import jwt  # PyJWT
+except Exception:  # pragma: no cover
+    jwt = None
 from dotenv import load_dotenv
 from openai import OpenAI
 
@@ -25,6 +29,12 @@ DEFAULT_RUNWAY_VERSION = "2024-11-06"
 
 # Per Runway docs: don’t expect updates more frequent than once every 5 seconds
 MIN_POLL_SECONDS = 5.0
+
+# Kling (Text-to-Video) defaults (see docs)
+# https://app.klingai.com/global/dev/document-api/apiReference/model/textToVideo
+DEFAULT_KLING_BASE = "https://api.klingai.com"
+DEFAULT_KLING_T2V_CREATE_PATH = "/v1/videos/text2video"
+DEFAULT_KLING_T2V_GET_PATH_TEMPLATE = "/v1/videos/text2video/{task_id}"
 
 
 # Runway ratio handling
@@ -156,6 +166,182 @@ def normalize_runway_ratio(ratio: Any, *, default: str) -> str:
 
     print(f"[ratio] Unrecognized '{raw}' and default '{default}' not in allowed list. Using '{RUNWAY_ALLOWED_RATIOS[0]}'.")
     return RUNWAY_ALLOWED_RATIOS[0]
+
+
+# -----------------------------
+# Kling client (Text-to-Video)
+# -----------------------------
+class KlingClient:
+    """
+    Minimal client for Kling Text-to-Video using JWT-based auth.
+    Docs:
+    - Create: POST /v1/videos/text2video
+    - Query:  GET  /v1/videos/text2video/{id}
+    https://app.klingai.com/global/dev/document-api/apiReference/model/textToVideo
+    """
+
+    def __init__(self, access_key: str, secret_key: str, base_url: str = DEFAULT_KLING_BASE):
+        self.access_key = access_key
+        self.secret_key = secret_key
+        self.base_url = base_url.rstrip("/")
+
+    def _token(self) -> str:
+        if jwt is None:
+            raise RuntimeError('PyJWT is not installed. Install it (pip install "PyJWT") to use Kling.')
+        headers = {"alg": "HS256", "typ": "JWT"}
+        payload = {
+            "iss": self.access_key,
+            "exp": int(time.time()) + 1800,  # now + 30min
+            "nbf": int(time.time()) - 5,     # now - 5s
+        }
+        t = jwt.encode(payload, self.secret_key, algorithm="HS256", headers=headers)
+        if isinstance(t, bytes):
+            t = t.decode("utf-8")
+        return t
+
+    def _headers(self) -> Dict[str, str]:
+        return {"Authorization": f"Bearer {self._token()}", "Content-Type": "application/json"}
+
+    def _safe_json(self, resp: requests.Response) -> Any:
+        try:
+            return resp.json()
+        except Exception:
+            return resp.text
+
+    def _request_with_429_retries(
+        self,
+        method: str,
+        path: str,
+        *,
+        json_body: dict | None = None,
+        timeout_s: int = 60,
+        max_retries: int = 6,
+    ) -> Any:
+        url = f"{self.base_url}{path}"
+        for attempt in range(max_retries + 1):
+            resp = requests.request(
+                method=method.upper(),
+                url=url,
+                headers=self._headers(),
+                json=json_body,
+                timeout=timeout_s,
+            )
+
+            if resp.status_code != 429:
+                if resp.status_code >= 400:
+                    raise RuntimeError(f"Kling HTTP {resp.status_code}: {self._safe_json(resp)}")
+                return resp.json()
+
+            if attempt == max_retries:
+                break
+
+            ra = resp.headers.get("Retry-After")
+            if ra:
+                try:
+                    sleep_s = float(ra)
+                except ValueError:
+                    sleep_s = 2.0
+            else:
+                sleep_s = min(60.0, (2 ** attempt)) + random.random()
+            print(f"[Kling 429] sleeping {sleep_s:.2f}s then retrying...")
+            time.sleep(sleep_s)
+
+        raise RuntimeError("Kling: still receiving 429 after retries (rate limit or credits/quota).")
+
+    def create_text_to_video(
+        self,
+        *,
+        prompt: str,
+        negative_prompt: Optional[str] = None,
+        model_name: str = "kling-v1",
+        aspect_ratio: str = "16:9",
+        duration_s: int = 5,
+        mode: str = "std",
+        sound: str = "off",
+        cfg_scale: Optional[float] = None,
+        external_task_id: Optional[str] = None,
+        callback_url: Optional[str] = None,
+    ) -> str:
+        # Docs list duration as string enum values "5", "10"
+        duration_str = str(int(duration_s))
+        payload: Dict[str, Any] = {
+            "model_name": model_name,
+            "prompt": prompt,
+            "aspect_ratio": aspect_ratio,
+            "duration": duration_str,
+            "mode": mode,
+            "sound": sound,
+        }
+        if negative_prompt:
+            payload["negative_prompt"] = negative_prompt
+        if cfg_scale is not None:
+            payload["cfg_scale"] = float(cfg_scale)
+        if external_task_id:
+            payload["external_task_id"] = external_task_id
+        if callback_url:
+            payload["callback_url"] = callback_url
+
+        resp = self._request_with_429_retries("POST", DEFAULT_KLING_T2V_CREATE_PATH, json_body=payload)
+        task_id = (resp.get("data") or {}).get("task_id")
+        if not task_id:
+            raise RuntimeError(f"Kling create_text_to_video missing data.task_id: {resp}")
+        return str(task_id)
+
+    def get_text_to_video(self, task_id: str) -> dict:
+        return self._request_with_429_retries("GET", DEFAULT_KLING_T2V_GET_PATH_TEMPLATE.format(task_id=task_id))
+
+    def wait_text_to_video(self, task_id: str, *, poll_s: float = 5.0, timeout_s: int = 1800) -> dict:
+        poll_s = max(5.0, poll_s)
+        start = time.time()
+        while True:
+            if time.time() - start > timeout_s:
+                raise TimeoutError(f"Timed out waiting for Kling task {task_id} after {timeout_s}s")
+
+            body = self.get_text_to_video(task_id)
+            data = body.get("data") or {}
+            status = str(data.get("task_status") or "").lower()
+            print(f"kling.status={status}")
+
+            if status == "succeed":
+                return body
+            if status == "failed":
+                raise RuntimeError(f"Kling task FAILED: {json.dumps(body, indent=2)}")
+
+            time.sleep(poll_s)
+
+
+def extract_kling_video_urls(resp: dict) -> List[str]:
+    data = resp.get("data") or {}
+    task_result = data.get("task_result") or {}
+    videos = task_result.get("videos") or []
+    out: List[str] = []
+    if isinstance(videos, list):
+        for v in videos:
+            if isinstance(v, dict):
+                url = v.get("url")
+                if isinstance(url, str) and url.startswith("http"):
+                    out.append(url)
+    return out
+
+
+def download_kling_videos(resp: dict) -> List[Path]:
+    data = resp.get("data") or {}
+    task_id = str(data.get("task_id") or "kling_task")
+    urls = extract_kling_video_urls(resp)
+    if not urls:
+        return []
+
+    out_dir = ASSETS_DIR / f"kling_{task_id}"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    saved: List[Path] = []
+    for i, url in enumerate(urls, start=1):
+        ext = guess_ext_from_url(url, ".mp4")
+        p = out_dir / f"video_{i}{ext}"
+        r = requests.get(url, timeout=300)
+        r.raise_for_status()
+        p.write_bytes(r.content)
+        saved.append(p)
+    return saved
 
 
 # -----------------------------
@@ -393,8 +579,10 @@ def file_link(p: Path) -> str:
 # -----------------------------
 # OpenAI tool wiring
 # -----------------------------
-def tool_schemas() -> List[dict]:
-    return [
+def tool_schemas(*, enable_runway: bool, enable_kling: bool) -> List[dict]:
+    tools: List[dict] = []
+    if enable_runway:
+        tools += [
         {
             "type": "function",
             "name": "runway_text_to_image",
@@ -450,13 +638,43 @@ def tool_schemas() -> List[dict]:
                 "required": ["image", "prompt"],
             },
         },
+        ]
+
+    if enable_kling:
+        tools.append(
+            {
+                "type": "function",
+                "name": "kling_text_to_video",
+                "description": "Generate a video from a text prompt via Kling (Text-to-Video). Saves outputs locally and returns local file paths + output URLs.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "prompt": {"type": "string"},
+                        "negative_prompt": {"type": "string"},
+                        "aspect_ratio": {"type": "string", "description": 'One of: "16:9", "9:16", "1:1" (default: 16:9)'},
+                        "duration": {"type": "integer", "description": "Seconds (supported: 5 or 10)"},
+                        "mode": {"type": "string", "description": 'Video mode: "std" or "pro" (default: std)'},
+                        "sound": {"type": "string", "description": 'Sound: "on" or "off" (default: off; only supported on newer models)'},
+                        "model_name": {
+                            "type": "string",
+                            "description": 'Model version, e.g. "kling-v1", "kling-v1-6", "kling-v2-5-turbo", "kling-v2-6"',
+                        },
+                        "cfg_scale": {"type": "number", "description": "Float in [0,1] (not supported by kling-v2.x per docs)"},
+                    },
+                    "required": ["prompt"],
+                },
+            }
+        )
+
+    tools.append(
         {
             "type": "function",
             "name": "list_saved_assets",
             "description": "List locally saved images/videos so the user can pick one by index.",
             "parameters": {"type": "object", "properties": {}},
         },
-    ]
+    )
+    return tools
 
 
 def system_instructions() -> str:
@@ -468,6 +686,7 @@ def system_instructions() -> str:
         "- Start by asking what the user wants to do (text-to-image, text-to-video, image-to-video).\n"
         "- If image-to-video: ask for an image (URL/runway URI/local path) OR offer to list saved assets.\n"
         '- When asking for a ratio, accept "16:9", "1:1", "9:16", "4:3" (or pixel sizes like "1920:1080").\n'
+        "- If the user asks for Kling text-to-video, call kling_text_to_video.\n"
         "- When you decide to generate, call the appropriate tool.\n"
         "- After tool results come back, show the user: (a) local file link(s) and (b) remote output URL(s).\n"
         "- Then ask what they want to do next.\n"
@@ -549,6 +768,36 @@ def runway_image_to_video_impl(runway: RunwayClient, store: AssetStore, args: di
     }
 
 
+def kling_text_to_video_impl(kling: KlingClient, store: AssetStore, args: dict) -> dict:
+    prompt = args["prompt"]
+    negative_prompt = args.get("negative_prompt")
+    aspect_ratio = args.get("aspect_ratio", "16:9")
+    duration = int(args.get("duration", 5))
+    mode = args.get("mode", "std")
+    sound = args.get("sound", "off")
+    model_name = args.get("model_name", "kling-v1")
+    cfg_scale = args.get("cfg_scale")
+
+    task_id = kling.create_text_to_video(
+        prompt=prompt,
+        negative_prompt=negative_prompt,
+        model_name=model_name,
+        aspect_ratio=aspect_ratio,
+        duration_s=duration,
+        mode=mode,
+        sound=sound,
+        cfg_scale=cfg_scale,
+    )
+    task = kling.wait_text_to_video(task_id, poll_s=5.0, timeout_s=3600)
+    saved = download_kling_videos(task)
+    urls = extract_kling_video_urls(task)
+
+    for p in saved:
+        store.add(Asset(kind="video", local_path=str(p), source_url=urls[0] if urls else None, created_at=now_iso(), runway_task_id=f"kling:{task_id}"))
+
+    return {"task_id": task_id, "saved_files": [str(p) for p in saved], "output_urls": urls}
+
+
 def list_saved_assets_impl(store: AssetStore) -> dict:
     return {"assets": store.list_summary(limit=20)}
 
@@ -561,8 +810,11 @@ def main() -> None:
 
     # Load env
     runway_key = (os.getenv("RUNWAYML_API_SECRET") or "").strip()
-    if not runway_key:
-        raise SystemExit("Missing RUNWAYML_API_SECRET in .env")
+    kling_ak = (os.getenv("KLING_ACCESS_KEY") or "").strip()
+    kling_sk = (os.getenv("KLING_SECRET_KEY") or "").strip()
+
+    if not runway_key and not (kling_ak and kling_sk):
+        raise SystemExit("Missing credentials. Set RUNWAYML_API_SECRET (Runway) and/or KLING_ACCESS_KEY + KLING_SECRET_KEY (Kling).")
 
     runway_base = (os.getenv("RUNWAY_API_BASE") or DEFAULT_RUNWAY_BASE).strip()
     runway_ver = (os.getenv("RUNWAY_API_VERSION") or DEFAULT_RUNWAY_VERSION).strip()
@@ -571,10 +823,15 @@ def main() -> None:
 
     # Init clients
     oai = OpenAI()
-    runway = RunwayClient(api_key=runway_key, base_url=runway_base, version=runway_ver)
+    runway: Optional[RunwayClient] = None
+    if runway_key:
+        runway = RunwayClient(api_key=runway_key, base_url=runway_base, version=runway_ver)
+    kling: Optional[KlingClient] = None
+    if kling_ak and kling_sk:
+        kling = KlingClient(access_key=kling_ak, secret_key=kling_sk, base_url=(os.getenv("KLING_API_BASE") or DEFAULT_KLING_BASE).strip())
     store = AssetStore(ASSETS_DIR / "catalog.json")
 
-    tools = tool_schemas()
+    tools = tool_schemas(enable_runway=bool(runway_key), enable_kling=bool(kling_ak and kling_sk))
     input_list: List[dict] = []
 
     print("\nMedia Assistant (OpenAI tool calling + Runway)")
@@ -604,11 +861,25 @@ def main() -> None:
                 args = json.loads(item.arguments) if isinstance(item.arguments, str) else (item.arguments or {})
 
                 if name == "runway_text_to_image":
-                    result = runway_text_to_image_impl(runway, store, args)
+                    if runway is None:
+                        result = {"error": "Runway is not configured. Set RUNWAYML_API_SECRET to use Runway tools."}
+                    else:
+                        result = runway_text_to_image_impl(runway, store, args)
                 elif name == "runway_text_to_video":
-                    result = runway_text_to_video_impl(runway, store, args)
+                    if runway is None:
+                        result = {"error": "Runway is not configured. Set RUNWAYML_API_SECRET to use Runway tools."}
+                    else:
+                        result = runway_text_to_video_impl(runway, store, args)
                 elif name == "runway_image_to_video":
-                    result = runway_image_to_video_impl(runway, store, args)
+                    if runway is None:
+                        result = {"error": "Runway is not configured. Set RUNWAYML_API_SECRET to use Runway tools."}
+                    else:
+                        result = runway_image_to_video_impl(runway, store, args)
+                elif name == "kling_text_to_video":
+                    if kling is None:
+                        result = {"error": "Kling is not configured. Set KLING_ACCESS_KEY and KLING_SECRET_KEY to use Kling tools."}
+                    else:
+                        result = kling_text_to_video_impl(kling, store, args)
                 elif name == "list_saved_assets":
                     result = list_saved_assets_impl(store)
                 else:
