@@ -44,9 +44,6 @@ NOTE: If any of the APP requires payment/ billing or for any reason you’re not
 Sheet is already open on new tab.
 
 """
-
-
-
 async def main():
     browser = Browser(
         use_cloud=False,
